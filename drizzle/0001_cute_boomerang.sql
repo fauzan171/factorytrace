@@ -1,0 +1,1 @@
+CREATE INDEX `idx_product_events_product_id` ON `product_events` (`product_id`);
