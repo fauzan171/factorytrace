@@ -252,16 +252,16 @@ Pilih skenario produk
 |---|---|
 | UI | React, TypeScript, responsive CSS |
 | 3D | Three.js melalui React Three Fiber |
-| Real-time simulation | Deterministic client simulation clock for hosted demo |
-| Production integration boundary | OPC UA client adapter concept |
+| Real-time simulation | Standalone Node.js PLC behavior model locally; deterministic client fallback when hosted |
+| Production integration boundary | `node-opcua` Server + backend Client Session/Subscription + HTTP/SSE bridge |
 | Persistence | Cloudflare D1-compatible SQLite schema |
 | Deployment | Cloudflare-compatible Sites build |
 
-Untuk demo hosted, simulator berjalan di application runtime agar dapat dicoba tanpa service lokal tambahan. Arsitektur kode memisahkan domain simulation dari UI sehingga adapter OPC UA nyata dapat ditambahkan kemudian.
+Untuk demo hosted, simulator berjalan di application runtime agar dapat dicoba tanpa service lokal tambahan. Untuk demo lokal, `npm run dev:opcua` menjalankan PLC behavior simulator sebagai OPC UA Server di loopback, backend bridge sebagai OPC UA Client, dan web app sebagai consumer HTTP/SSE. Implementasi ini bukan emulator firmware atau ladder Keyence KV-8000.
 
 ### 7.5 Tag model
 
-Contoh namespace OPC UA yang akan dimodelkan:
+Namespace OPC UA lokal yang diimplementasikan:
 
 ```text
 FactoryTrace/PKG02/Line/Mode
@@ -303,7 +303,7 @@ FactoryTrace/PKG02/Command/ResetRequest
 
 ### Release 1.1 — Integration readiness
 
-- Formal OPC UA tag contract export.
+- Local OPC UA Server, Client Subscription, and writable command tag contract.
 - Configurable endpoint and certificate setup.
 - Recorded payload playback from a real PLC session.
 - CSV genealogy export and richer alarm acknowledgment.
@@ -329,4 +329,3 @@ Release 1 dianggap selesai jika:
 6. Semua tombol utama bekerja dengan mouse dan keyboard.
 7. Tampilan dapat digunakan pada desktop dan tablet tanpa konten utama terpotong.
 8. Production build berhasil tanpa error.
-

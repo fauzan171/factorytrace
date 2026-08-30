@@ -18,7 +18,7 @@ export const productUnits = sqliteTable("product_units", {
   completedAt: text("completed_at").notNull(),
   payload: text("payload").notNull(),
 }, (table) => [
-  uniqueIndex("idx_product_units_serial").on(table.serialNumber),
+  index("idx_product_units_serial").on(table.serialNumber),
   uniqueIndex("idx_product_units_sequence").on(table.sequenceNumber),
 ]);
 

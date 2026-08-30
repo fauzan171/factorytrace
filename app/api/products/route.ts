@@ -14,7 +14,10 @@ async function ensureSchema(db:DemoDatabase) {
       reason_code TEXT, label_offset_mm REAL, cap_confidence REAL, code_grade TEXT,
       created_at TEXT NOT NULL, completed_at TEXT NOT NULL, payload TEXT NOT NULL
     )`),
-    db.prepare("CREATE UNIQUE INDEX IF NOT EXISTS idx_product_units_serial ON product_units(serial_number)"),
+    // A duplicate serial is itself a traceability observation. Keep every unit
+    // record and index the serial for lookup instead of replacing the original.
+    db.prepare("DROP INDEX IF EXISTS idx_product_units_serial"),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_product_units_serial ON product_units(serial_number)"),
     db.prepare("CREATE UNIQUE INDEX IF NOT EXISTS idx_product_units_sequence ON product_units(sequence_number)"),
     db.prepare(`CREATE TABLE IF NOT EXISTS product_events (
       id TEXT PRIMARY KEY, product_id TEXT NOT NULL, event_type TEXT NOT NULL,

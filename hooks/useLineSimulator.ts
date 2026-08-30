@@ -7,6 +7,13 @@ import { seedProducts } from "@/lib/seed-data";
 const clock = () => new Intl.DateTimeFormat("en-GB", { hour:"2-digit", minute:"2-digit", second:"2-digit", fractionalSecondDigits:3, hour12:false, timeZone:"Asia/Jakarta" }).format(new Date());
 const iso = () => new Date().toISOString();
 const event = (product:ProductUnit, station:string, type:string, title:string, detail:string, tone:ProductEvent["tone"]): ProductEvent => ({ id:`${product.id}-${type}`, at:clock(), station, type, title, detail, tone });
+const bridgeUrl = "http://127.0.0.1:4001";
+type LineState = "RUNNING"|"STOPPED"|"EMERGENCY_STOP";
+type PlcSnapshot = { lineState:LineState; scenario?:Scenario; activeProducts:ProductUnit[]; recentProducts:ProductUnit[]; alarms:Alarm[] };
+async function bridgeCommand(command:string,value?:unknown) {
+  const response=await fetch(`${bridgeUrl}/api/command`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({command,value})});
+  if (!response.ok) throw new Error(`PLC bridge rejected ${command} (${response.status})`);
+}
 
 function advanceProduct(product:ProductUnit): ProductUnit {
   const next = { ...product, events:[...product.events] };
@@ -47,24 +54,41 @@ function advanceProduct(product:ProductUnit): ProductUnit {
   }
   if (next.stage === "decision" && next.position >= 82) {
     next.stage = next.disposition === "REJECT" ? "reject" : "accepted";
-    next.events.unshift(event(next,"S04",next.disposition === "REJECT" ? "REJECT_CONFIRMED" : "PRODUCT_ACCEPTED",next.disposition === "REJECT" ? "Reject confirmed" : "Product accepted",next.disposition === "REJECT" ? `${next.reasonCode} · bin sensor confirmed` : "Released to case packing",next.disposition === "REJECT" ? "warn" : "good"));
+    next.events.unshift(event(next,"S04",next.disposition === "REJECT" ? "REJECT_ACTUATED" : "PRODUCT_ACCEPTED",next.disposition === "REJECT" ? "Reject sequence started" : "Product accepted",next.disposition === "REJECT" ? `${next.reasonCode} · pneumatic pusher extending` : "Released to case packing",next.disposition === "REJECT" ? "warn" : "good"));
+  }
+  if (next.stage === "reject" && next.position >= 100 && !next.events.some((item) => item.type === "REJECT_CONFIRMED")) {
+    next.events.unshift(event(next,"S04","REJECT_CONFIRMED","Reject confirmed",`${next.reasonCode} · reject-bin sensor occupied`,"warn"));
   }
   if ((next.stage === "accepted" || next.stage === "reject") && next.position >= 104 && !next.completedAt) next.completedAt = iso();
   return next;
 }
 
 export function useLineSimulator() {
-  const [lineState,setLineState] = useState<"RUNNING"|"STOPPED">("RUNNING");
+  const [lineState,setLineStateLocal] = useState<LineState>("RUNNING");
   const [activeProducts,setActiveProducts] = useState<ProductUnit[]>([]);
   const [recentProducts,setRecentProducts] = useState<ProductUnit[]>(seedProducts);
   const [alarms,setAlarms] = useState<Alarm[]>([]);
   const [scenario,setScenario] = useState<Scenario>("normal");
+  const [integrationMode,setIntegrationMode] = useState<"BROWSER_SIM"|"OPC_UA">("BROWSER_SIM");
+  const [opcConnected,setOpcConnected] = useState(false);
   const sequence = useRef(1842);
+  const persistedProductIds = useRef(new Set<string>());
+
+  const sendBridgeCommand = useCallback(async (command:string,value?:unknown) => {
+    try {
+      await bridgeCommand(command,value);
+    } catch {
+      // Keep the last authoritative PLC state visible. A transport failure is
+      // not evidence that the physical line stopped.
+      setOpcConnected(false);
+    }
+  },[]);
 
   useEffect(() => {
     fetch("/api/products").then((response) => response.ok ? response.json() : Promise.reject()).then((value:unknown) => {
       const data=value as {products:ProductUnit[]};
       if (!data.products?.length) return;
+      data.products.forEach((product) => persistedProductIds.current.add(product.id));
       setRecentProducts((current) => {
         const merged=[...data.products,...current];
         return merged.filter((product,index) => merged.findIndex((candidate) => candidate.id === product.id) === index).slice(0,24);
@@ -74,10 +98,45 @@ export function useLineSimulator() {
   },[]);
 
   useEffect(() => {
-    if (lineState !== "RUNNING") return;
+    let events:EventSource|undefined;
+    let cancelled=false;
+    fetch(`${bridgeUrl}/health`).then((response) => response.ok ? response.json() : Promise.reject()).then(() => {
+      if(cancelled) return;
+      setIntegrationMode("OPC_UA"); setOpcConnected(true);
+      events=new EventSource(`${bridgeUrl}/api/events`);
+      events.onopen=() => setOpcConnected(true);
+      events.onmessage=(message) => {
+        try {
+          const data=JSON.parse(message.data) as PlcSnapshot;
+          setLineStateLocal(data.lineState); setActiveProducts(data.activeProducts); setAlarms(data.alarms);
+          if(data.scenario) setScenario(data.scenario);
+          if(data.recentProducts.length) {
+            for (const product of data.recentProducts) {
+              if (persistedProductIds.current.has(product.id)) continue;
+              persistedProductIds.current.add(product.id);
+              void fetch("/api/products", { method:"POST", headers:{"content-type":"application/json"}, body:JSON.stringify(product) }).catch(() => persistedProductIds.current.delete(product.id));
+            }
+            setRecentProducts((current) => [...data.recentProducts,...current].filter((product,index,list) => list.findIndex((candidate) => candidate.id === product.id) === index).slice(0,24));
+          }
+        } catch {
+          setOpcConnected(false);
+        }
+      };
+      events.onerror=() => setOpcConnected(false);
+    }).catch(() => { if(!cancelled){setIntegrationMode("BROWSER_SIM");setOpcConnected(false);} });
+    return () => { cancelled=true; events?.close(); };
+  },[]);
+
+  useEffect(() => {
+    if (integrationMode !== "BROWSER_SIM" || lineState !== "RUNNING") return;
     const timer = window.setInterval(() => {
       const completed:ProductUnit[] = [];
-      setActiveProducts((current) => current.map((p) => advanceProduct({ ...p, position:p.position+1.25 })).filter((p) => {
+      setActiveProducts((current) => current.map((p) => {
+        // Slow only the physical reject stroke so the actuator, transfer, and
+        // confirmation are observable. The main conveyor keeps its normal rate.
+        const increment = p.stage === "reject" ? .5 : 1.25;
+        return advanceProduct({ ...p, position:p.position+increment });
+      }).filter((p) => {
         if (p.completedAt) completed.push(p);
         return !p.completedAt;
       }));
@@ -87,23 +146,50 @@ export function useLineSimulator() {
       }
     },100);
     return () => window.clearInterval(timer);
-  },[lineState]);
+  },[integrationMode,lineState]);
 
   const inject = useCallback(() => {
     if (lineState !== "RUNNING") return false;
+    const selectedScenario = scenario;
+    if (integrationMode === "OPC_UA") {
+      void sendBridgeCommand("inject",selectedScenario);
+      setScenario("normal");
+      return true;
+    }
     const seq = sequence.current++;
     const id = `live-${Date.now()}-${seq}`;
-    const serial = scenario === "duplicate_serial" ? seedProducts[0].serial : productSerial(seq);
-    const product:ProductUnit = { id, sequence:seq, serial, scenario, position:0, stage:"created", visionResult:"PENDING", barcodeResult:"PENDING", disposition:"PENDING", reasonCode:null, labelOffsetMm:null, capConfidence:null, codeGrade:null, createdAt:iso(), completedAt:null, events:[{ id:`${id}-created`, at:clock(), station:"PLC", type:"TRACKING_CREATED", title:"Tracking record created", detail:`Scenario profile · ${scenario.replaceAll("_"," ")}`, tone:"neutral" }] };
+    const serial = selectedScenario === "duplicate_serial" ? seedProducts[0].serial : productSerial(seq);
+    const product:ProductUnit = { id, sequence:seq, serial, scenario:selectedScenario, position:0, stage:"created", visionResult:"PENDING", barcodeResult:"PENDING", disposition:"PENDING", reasonCode:null, labelOffsetMm:null, capConfidence:null, codeGrade:null, createdAt:iso(), completedAt:null, events:[{ id:`${id}-created`, at:clock(), station:"PLC", type:"TRACKING_CREATED", title:"Tracking record created", detail:`Scenario profile · ${selectedScenario.replaceAll("_"," ")}`, tone:"neutral" }] };
     setActiveProducts((current) => [...current,product]);
-    if (scenario === "backend_timeout") window.setTimeout(() => setAlarms((current) => [{ id:`alarm-${Date.now()}`, code:"COM-BE-500", severity:"CRITICAL", source:"Traceability backend", message:"Validation response exceeded 500 ms fail-safe window", raisedAt:clock(), acknowledged:false },...current]),4600);
+    setScenario("normal");
+    if (selectedScenario === "backend_timeout") window.setTimeout(() => setAlarms((current) => [{ id:`alarm-${Date.now()}`, code:"COM-BE-500", severity:"CRITICAL", source:"Traceability backend", message:"Validation response exceeded 500 ms fail-safe window", raisedAt:clock(), acknowledged:false },...current]),4600);
     return true;
-  },[lineState,scenario]);
+  },[integrationMode,lineState,scenario,sendBridgeCommand]);
 
-  const reset = useCallback(() => { setActiveProducts([]); setAlarms([]); setLineState("STOPPED"); },[]);
-  const acknowledge = useCallback((id:string) => setAlarms((items) => items.map((a) => a.id === id ? {...a,acknowledged:true}:a)),[]);
+  const setLineState = useCallback((state:LineState) => {
+    if(integrationMode === "OPC_UA") { void sendBridgeCommand(state === "RUNNING" ? "start" : state === "EMERGENCY_STOP" ? "emergency" : "stop"); return; }
+    setLineStateLocal(state);
+  },[integrationMode,sendBridgeCommand]);
+  const reset = useCallback(() => {
+    if(integrationMode === "OPC_UA") { void sendBridgeCommand("reset"); return; }
+    setActiveProducts([]); setAlarms([]); setLineStateLocal("STOPPED");
+  },[integrationMode,sendBridgeCommand]);
+  const emergencyStop = useCallback(() => {
+    if(integrationMode === "OPC_UA") { void sendBridgeCommand("emergency"); return; }
+    setLineStateLocal("EMERGENCY_STOP");
+    setAlarms((current) => current.some((alarm) => alarm.code === "SAFETY-ESTOP" && !alarm.acknowledged) ? current : [{ id:`alarm-estop-${Date.now()}`, code:"SAFETY-ESTOP", severity:"CRITICAL", source:"Safety circuit", message:"Emergency stop latched — motion and simulated outputs inhibited", raisedAt:clock(), acknowledged:false },...current]);
+  },[integrationMode,sendBridgeCommand]);
+  const resetSafety = useCallback(() => {
+    if(integrationMode === "OPC_UA") { void sendBridgeCommand("resetSafety"); return; }
+    setLineStateLocal("STOPPED");
+    setAlarms((current) => current.map((alarm) => alarm.code === "SAFETY-ESTOP" ? {...alarm,acknowledged:true} : alarm));
+  },[integrationMode,sendBridgeCommand]);
+  const acknowledge = useCallback((id:string) => {
+    setAlarms((items) => items.map((a) => a.id === id ? {...a,acknowledged:true}:a));
+    if (integrationMode === "OPC_UA") void sendBridgeCommand("acknowledge",id);
+  },[integrationMode,sendBridgeCommand]);
   const currentProduct = useMemo(() => [...activeProducts].sort((a,b) => b.position-a.position)[0] ?? recentProducts[0], [activeProducts,recentProducts]);
   const liveEvents = useMemo(() => [...activeProducts.flatMap((p) => p.events),...recentProducts.slice(0,3).flatMap((p) => p.events)].sort((a,b) => b.at.localeCompare(a.at)).slice(0,8), [activeProducts,recentProducts]);
 
-  return { lineState,setLineState,activeProducts,recentProducts,alarms,scenario,setScenario,inject,reset,acknowledge,currentProduct,liveEvents };
+  return { lineState,setLineState,activeProducts,recentProducts,alarms,scenario,setScenario,inject,reset,emergencyStop,resetSafety,acknowledge,currentProduct,liveEvents,integrationMode,opcConnected };
 }
